@@ -22,9 +22,15 @@ services:
       - key: SESSION_COOKIE_SECURE
         value: "true"
       - key: LOCATION_REQUIRED
-        value: "false"
+        value: "true"
+      - key: GPS_RADIUS_METERS
+        value: "50"
       - key: QR_VALIDITY_MINUTES
-        value: "10"
+        value: "5"
+      - key: QR_ROTATE_SECONDS
+        value: "15"
+      - key: SUBJECT_COOLDOWN_HOURS
+        value: "12"
 
 databases:
   - name: classmark-attendance-db

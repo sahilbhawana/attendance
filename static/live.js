@@ -8,7 +8,24 @@ if (timer) {
   };
   update();
   setInterval(update, 1000);
+
+  const refreshQr = async () => {
+    try {
+      const response = await fetch(window.QR_REFRESH_URL, {cache: 'no-store'});
+      if (!response.ok) { location.reload(); return; }
+      const data = await response.json();
+      if (!data.open) { location.reload(); return; }
+      document.querySelector('#live-qr').src = data.qr_data;
+      const link = document.querySelector('#scan-url');
+      link.href = data.scan_url;
+      link.textContent = data.scan_url;
+    } catch (_) {
+      // The page will try again on the next refresh interval.
+    }
+  };
+  setInterval(refreshQr, 4000);
 }
+
 document.querySelector('#copy-link')?.addEventListener('click', async event => {
   const link = document.querySelector('#scan-url').href;
   try {

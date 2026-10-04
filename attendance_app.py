@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import csv
+import hashlib
+import hmac
 import io
 import math
 import os
@@ -13,13 +15,14 @@ from pathlib import Path
 import qrcode
 from dotenv import load_dotenv
 from flask import (
-    Flask, Response, abort, current_app, flash, redirect, render_template,
+    Flask, Response, abort, current_app, flash, jsonify, redirect, render_template,
     request, session, url_for,
 )
 from flask_sqlalchemy import SQLAlchemy
 from openpyxl import load_workbook
 from sqlalchemy.exc import IntegrityError
 from werkzeug.middleware.proxy_fix import ProxyFix
+from werkzeug.security import check_password_hash, generate_password_hash
 
 
 ROOT = Path(__file__).resolve().parent
@@ -36,6 +39,14 @@ class Student(db.Model):
     roll_no = db.Column(db.String(64), unique=True, nullable=False, index=True)
     name = db.Column(db.String(150), nullable=False)
     is_active = db.Column(db.Boolean, nullable=False, default=True)
+    credential = db.relationship("StudentCredential", back_populates="student", uselist=False, cascade="all, delete-orphan")
+
+
+class StudentCredential(db.Model):
+    student_id = db.Column(db.Integer, db.ForeignKey("student.id"), primary_key=True)
+    pin_hash = db.Column(db.String(255), nullable=False)
+    updated_at = db.Column(db.DateTime, nullable=False, default=utcnow)
+    student = db.relationship(Student, back_populates="credential")
 
 
 class Subject(db.Model):
@@ -83,6 +94,22 @@ class AttendanceRecord(db.Model):
     __table_args__ = (db.UniqueConstraint("attendance_session_id", "student_id", name="uq_attendance_session_student"),)
 
 
+class PinExportBatch(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    token = db.Column(db.String(48), unique=True, nullable=False, index=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=utcnow)
+    rows = db.relationship("PinExportRow", back_populates="batch", cascade="all, delete-orphan")
+
+
+class PinExportRow(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    batch_id = db.Column(db.Integer, db.ForeignKey("pin_export_batch.id"), nullable=False)
+    roll_no = db.Column(db.String(64), nullable=False)
+    name = db.Column(db.String(150), nullable=False)
+    pin = db.Column(db.String(20), nullable=False)
+    batch = db.relationship(PinExportBatch, back_populates="rows")
+
+
 def create_app(test_config: dict | None = None) -> Flask:
     app = Flask(__name__, template_folder="templates", static_folder="static", instance_path=str(ROOT / "instance"))
     Path(app.instance_path).mkdir(parents=True, exist_ok=True)
@@ -99,9 +126,11 @@ def create_app(test_config: dict | None = None) -> Flask:
         ADMIN_USERNAME=os.getenv("ADMIN_USERNAME", "admin"),
         ADMIN_PASSWORD=os.getenv("ADMIN_PASSWORD", "admin123"),
         PUBLIC_BASE_URL=os.getenv("PUBLIC_BASE_URL", "").rstrip("/"),
-        QR_VALIDITY_MINUTES=int(os.getenv("QR_VALIDITY_MINUTES", "10")),
-        LOCATION_REQUIRED=os.getenv("LOCATION_REQUIRED", "false").lower() == "true",
-        GPS_RADIUS_METERS=int(os.getenv("GPS_RADIUS_METERS", "100")),
+        QR_VALIDITY_MINUTES=int(os.getenv("QR_VALIDITY_MINUTES", "5")),
+        QR_ROTATE_SECONDS=int(os.getenv("QR_ROTATE_SECONDS", "15")),
+        SUBJECT_COOLDOWN_HOURS=int(os.getenv("SUBJECT_COOLDOWN_HOURS", "12")),
+        LOCATION_REQUIRED=os.getenv("LOCATION_REQUIRED", "true").lower() == "true",
+        GPS_RADIUS_METERS=int(os.getenv("GPS_RADIUS_METERS", "50")),
         MAX_CONTENT_LENGTH=10 * 1024 * 1024,
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
@@ -174,6 +203,43 @@ def normalize_roll(value) -> str:
     return str(value).strip()
 
 
+def make_student_pin() -> str:
+    return f"{secrets.randbelow(100_000_000):08d}"
+
+
+def qr_code_for(attendance_session: AttendanceSession, at: datetime | None = None) -> str:
+    at = at or utcnow()
+    slot = int(at.replace(tzinfo=timezone.utc).timestamp()) // current_app.config["QR_ROTATE_SECONDS"]
+    message = f"{attendance_session.id}:{attendance_session.token}:{slot}".encode("utf-8")
+    key = current_app.config["SECRET_KEY"].encode("utf-8")
+    return hmac.new(key, message, hashlib.sha256).hexdigest()[:20]
+
+
+def valid_qr_code(attendance_session: AttendanceSession, code: str) -> bool:
+    expected = qr_code_for(attendance_session)
+    return secrets.compare_digest(expected, code)
+
+
+def utc_timestamp(value: datetime) -> float:
+    """Interpret database timestamps as UTC even when the host uses local time."""
+    return value.replace(tzinfo=timezone.utc).timestamp()
+
+
+def current_scan_url(attendance_session: AttendanceSession) -> str:
+    code = qr_code_for(attendance_session)
+    base = current_app.config["PUBLIC_BASE_URL"]
+    if base:
+        return f"{base}{url_for('student_scan', token=attendance_session.token, code=code)}"
+    return url_for("student_scan", token=attendance_session.token, code=code, _external=True)
+
+
+def qr_data_uri(scan_url: str) -> str:
+    qr = qrcode.make(scan_url)
+    buffer = io.BytesIO()
+    qr.save(buffer, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
 def roster_rows(file_storage):
     filename = (file_storage.filename or "").lower()
     if filename.endswith(".csv"):
@@ -188,6 +254,7 @@ def roster_rows(file_storage):
     headers = [normalized_header(v) for v in rows[0]]
     roll_col = next((i for i, value in enumerate(headers) if value in {"roll", "rollno", "rollnumber", "studentid"}), None)
     name_col = next((i for i, value in enumerate(headers) if value in {"name", "studentname"}), None)
+    pin_col = next((i for i, value in enumerate(headers) if value in {"pin", "studentpin", "attendancepin"}), None)
     if roll_col is None or name_col is None:
         raise ValueError("Header mein Roll No aur Name columns hone chahiye.")
     result = []
@@ -195,8 +262,11 @@ def roster_rows(file_storage):
         if row is None or max(roll_col, name_col) >= len(row):
             continue
         roll, name = normalize_roll(row[roll_col]), str(row[name_col] or "").strip()
+        pin = str(row[pin_col] or "").strip() if pin_col is not None and pin_col < len(row) else ""
         if roll and name:
-            result.append((roll, name))
+            if pin and not 6 <= len(pin) <= 20:
+                raise ValueError(f"PIN for roll number {roll} must be 6 to 20 characters.")
+            result.append((roll, name, pin))
     if not result:
         raise ValueError("File mein valid student rows nahi mili.")
     return result
@@ -237,7 +307,16 @@ def register_routes(app: Flask) -> None:
         students = Student.query.order_by(Student.roll_no).all()
         subjects = Subject.query.order_by(Subject.name).all()
         recent = AttendanceSession.query.order_by(AttendanceSession.started_at.desc()).limit(12).all()
-        return render_template("dashboard.html", students=students, subjects=subjects, recent=recent)
+        pin_batch = None
+        batch_token = session.get("pin_export_token")
+        if batch_token:
+            pin_batch = PinExportBatch.query.filter_by(token=batch_token).first()
+            if pin_batch and pin_batch.created_at < utcnow() - timedelta(hours=24):
+                db.session.delete(pin_batch)
+                db.session.commit()
+                pin_batch = None
+                session.pop("pin_export_token", None)
+        return render_template("dashboard.html", students=students, subjects=subjects, recent=recent, pin_batch=pin_batch)
 
     @app.post("/admin/roster")
     @admin_required
@@ -250,20 +329,65 @@ def register_routes(app: Flask) -> None:
         try:
             items = roster_rows(upload)
             added = updated = 0
-            for roll_no, name in items:
+            generated_pins = []
+            for roll_no, name, provided_pin in items:
                 student = Student.query.filter_by(roll_no=roll_no).first()
                 if student:
                     student.name, student.is_active = name, True
                     updated += 1
                 else:
-                    db.session.add(Student(roll_no=roll_no, name=name))
+                    student = Student(roll_no=roll_no, name=name)
+                    db.session.add(student)
                     added += 1
+                db.session.flush()
+                credential = StudentCredential.query.filter_by(student_id=student.id).first()
+                if provided_pin:
+                    pin = provided_pin
+                elif credential:
+                    pin = ""
+                else:
+                    pin = make_student_pin()
+                if pin:
+                    if credential:
+                        credential.pin_hash = generate_password_hash(pin)
+                        credential.updated_at = utcnow()
+                    else:
+                        credential = StudentCredential(student_id=student.id, pin_hash=generate_password_hash(pin))
+                        db.session.add(credential)
+                    if not provided_pin:
+                        generated_pins.append((roll_no, name, pin))
             db.session.commit()
             flash(f"Roster import complete: {added} naye, {updated} updated.", "success")
+            if generated_pins:
+                batch = PinExportBatch(token=secrets.token_urlsafe(24))
+                batch.rows = [PinExportRow(roll_no=roll, name=name, pin=pin) for roll, name, pin in generated_pins]
+                db.session.add(batch)
+                db.session.commit()
+                session["pin_export_token"] = batch.token
+                flash("Naye students ke PIN ek baar download karke unhe privately de do.", "success")
         except Exception as exc:
             db.session.rollback()
             flash(f"Roster import nahi hua: {exc}", "error")
         return redirect(url_for("dashboard"))
+
+    @app.get("/admin/roster/pins/<token>.csv")
+    @admin_required
+    def download_pin_sheet(token: str):
+        batch = PinExportBatch.query.filter_by(token=token).first_or_404()
+        if batch.created_at < utcnow() - timedelta(hours=24):
+            db.session.delete(batch)
+            db.session.commit()
+            session.pop("pin_export_token", None)
+            abort(404)
+        output = io.StringIO(newline="")
+        writer = csv.writer(output)
+        writer.writerow(["Roll No", "Name", "Personal PIN"])
+        for row in batch.rows:
+            writer.writerow([row.roll_no, row.name, row.pin])
+        db.session.delete(batch)
+        db.session.commit()
+        session.pop("pin_export_token", None)
+        return Response("\ufeff" + output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=student_pins_once.csv", "Cache-Control": "no-store"})
 
     @app.post("/admin/subjects")
     @admin_required
@@ -285,6 +409,17 @@ def register_routes(app: Flask) -> None:
     def start_session(subject_id: int):
         check_csrf()
         subject = db.get_or_404(Subject, subject_id)
+        previous = AttendanceSession.query.filter_by(subject_id=subject.id).order_by(AttendanceSession.started_at.desc()).first()
+        if previous:
+            if previous.is_open:
+                flash(f"{subject.name} ka session abhi live hai. Pehle usse close karein.", "error")
+                return redirect(url_for("dashboard"))
+            closed_at = previous.closed_at or previous.expires_at
+            available_at = closed_at + timedelta(hours=current_app.config["SUBJECT_COOLDOWN_HOURS"])
+            if available_at > utcnow():
+                wait_minutes = math.ceil((available_at - utcnow()).total_seconds() / 60)
+                flash(f"{subject.name} ka QR dobara {wait_minutes // 60} ghante {wait_minutes % 60} minute baad start ho sakta hai (12-hour subject lock).", "error")
+                return redirect(url_for("dashboard"))
         roster = Student.query.filter_by(is_active=True).order_by(Student.roll_no).all()
         if not roster:
             flash("Pehle student roster import karo.", "error")
@@ -294,9 +429,6 @@ def register_routes(app: Flask) -> None:
         except ValueError as exc:
             flash(str(exc), "error")
             return redirect(url_for("dashboard"))
-        # Starting a new class closes stale open sessions so students see one current QR.
-        for previous in AttendanceSession.query.filter(AttendanceSession.closed_at.is_(None)).all():
-            previous.closed_at = utcnow()
         attendance_session = AttendanceSession(
             subject=subject,
             token=secrets.token_urlsafe(32),
@@ -314,14 +446,21 @@ def register_routes(app: Flask) -> None:
     @admin_required
     def live_session(session_id: int):
         attendance_session = db.get_or_404(AttendanceSession, session_id)
-        base = current_app.config["PUBLIC_BASE_URL"]
-        scan_url = f"{base}{url_for('student_scan', token=attendance_session.token)}" if base else url_for("student_scan", token=attendance_session.token, _external=True)
-        png = qrcode.make(scan_url)
-        image = io.BytesIO()
-        png.save(image, format="PNG")
-        qr_data = "data:image/png;base64," + base64.b64encode(image.getvalue()).decode("ascii")
+        scan_url = current_scan_url(attendance_session)
+        qr_data = qr_data_uri(scan_url)
         present_count = AttendanceRecord.query.filter_by(attendance_session_id=attendance_session.id).count()
         return render_template("live.html", s=attendance_session, scan_url=scan_url, qr_data=qr_data, present_count=present_count)
+
+    @app.get("/admin/session/<int:session_id>/qr.json")
+    @admin_required
+    def refresh_session_qr(session_id: int):
+        attendance_session = db.get_or_404(AttendanceSession, session_id)
+        if not attendance_session.is_open:
+            return jsonify({"open": False}), 410
+        scan_url = current_scan_url(attendance_session)
+        response = jsonify({"open": True, "scan_url": scan_url, "qr_data": qr_data_uri(scan_url)})
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        return response
 
     @app.post("/admin/session/<int:session_id>/close")
     @admin_required
@@ -347,37 +486,53 @@ def register_routes(app: Flask) -> None:
         filename = f"{attendance_session.subject.name.lower().replace(' ', '_')}_session_{session_id}.csv"
         return Response("\ufeff" + output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": f"attachment; filename={filename}"})
 
-    @app.route("/scan/<token>", methods=["GET", "POST"])
-    def student_scan(token: str):
+    @app.route("/scan/<token>/<code>", methods=["GET", "POST"])
+    def student_scan(token: str, code: str):
         attendance_session = AttendanceSession.query.filter_by(token=token).first_or_404()
         if request.method == "GET":
+            if session.get("attendance_locked_session_id") == attendance_session.id:
+                return render_template("scan.html", s=attendance_session, result="Aapki present is device par pehle hi lag chuki hai. Aap kisi aur ki attendance nahi laga sakte.", success=False)
             if not attendance_session.is_open:
                 return render_template("scan.html", s=attendance_session, result="Yeh QR expire ho chuka hai. Teacher se naya QR lo.", success=False)
-            return render_template("scan.html", s=attendance_session)
+            access_key = f"scan_access_{attendance_session.id}"
+            access_until = session.get(access_key, 0)
+            now_ts = datetime.now(timezone.utc).timestamp()
+            if not valid_qr_code(attendance_session, code) and access_until <= now_ts:
+                return render_template("scan.html", s=attendance_session, result="QR photo purani ho chuki hai. Teacher ke live screen se current QR scan karein.", success=False)
+            session[access_key] = min(utc_timestamp(attendance_session.expires_at), now_ts + 300)
+            return render_template("scan.html", s=attendance_session, code=code)
         check_csrf()
         if not attendance_session.is_open:
             return render_template("scan.html", s=attendance_session, result="Session close ya expire ho gaya hai.", success=False)
+        access_key = f"scan_access_{attendance_session.id}"
+        if session.get(access_key, 0) <= datetime.now(timezone.utc).timestamp():
+            return render_template("scan.html", s=attendance_session, result="QR access expire ho gaya. Live QR ko dobara scan karein.", success=False)
+        if session.get("attendance_locked_session_id") == attendance_session.id:
+            return render_template("scan.html", s=attendance_session, result="Aapki present is device par pehle hi lag chuki hai. Aap kisi aur ki attendance nahi laga sakte.", success=False)
         roll_no = request.form.get("roll_no", "").strip()
+        pin = request.form.get("pin", "").strip()
         entry = SessionStudent.query.filter_by(attendance_session_id=attendance_session.id, roll_no=roll_no).first()
-        if not entry:
-            return render_template("scan.html", s=attendance_session, result="Yeh roll number is class ki active list mein nahi hai.", success=False)
+        if not entry or not entry.student.credential or not check_password_hash(entry.student.credential.pin_hash, pin):
+            return render_template("scan.html", s=attendance_session, code=code, result="Roll number ya personal PIN sahi nahi hai.", success=False)
         if AttendanceRecord.query.filter_by(attendance_session_id=attendance_session.id, student_id=entry.student_id).first():
-            return render_template("scan.html", s=attendance_session, result="Is QR ke liye attendance pehle hi mark ho chuki hai.", success=False)
+            return render_template("scan.html", s=attendance_session, result="Aapki present is subject mein pehle hi mark hai; 12 ghante baad hi dobara mark ho sakti hai.", success=False)
         distance = None
         if current_app.config["LOCATION_REQUIRED"]:
             try:
                 latitude, longitude = parse_location(request.form)
             except ValueError as exc:
-                return render_template("scan.html", s=attendance_session, result=str(exc), success=False)
+                return render_template("scan.html", s=attendance_session, code=code, result=str(exc), success=False)
             distance = haversine_meters(attendance_session.admin_latitude, attendance_session.admin_longitude, latitude, longitude)
             if distance > current_app.config["GPS_RADIUS_METERS"]:
-                return render_template("scan.html", s=attendance_session, result=f"Class location se {distance:.0f} m door ho. Limit {current_app.config['GPS_RADIUS_METERS']} m hai.", success=False)
+                return render_template("scan.html", s=attendance_session, code=code, result=f"Aap out of range ho: class se {distance:.0f} m door. Attendance ke liye {current_app.config['GPS_RADIUS_METERS']} m ke andar aao.", success=False)
         db.session.add(AttendanceRecord(attendance_session=attendance_session, student_id=entry.student_id, gps_distance_meters=distance))
         try:
             db.session.commit()
         except IntegrityError:
             db.session.rollback()
             return render_template("scan.html", s=attendance_session, result="Attendance pehle hi mark ho chuki hai.", success=False)
+        session["attendance_locked_session_id"] = attendance_session.id
+        session["attendance_locked_roll_no"] = entry.roll_no
         return render_template("scan.html", s=attendance_session, result=f"Present mark ho gaya. Welcome, {entry.name}.", success=True)
 
 
