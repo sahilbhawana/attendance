@@ -1,6 +1,6 @@
 # Classmark QR Attendance
 
-A Flask QR attendance app with a teacher dashboard, roster import, short-lived QR links, personal student PINs, GPS distance checks, and downloadable CSV reports.
+A Flask QR attendance app with a teacher dashboard, roster import, short-lived QR links, same-browser repeat-scan blocking, GPS distance checks, and downloadable CSV reports.
 
 ## Run locally in VS Code (Windows)
 
@@ -20,20 +20,20 @@ Edit `.env` and set a strong admin password and secret key. Start the app:
 
 Open `http://127.0.0.1:5000`. Localhost supports location prompts. Phones need the deployed HTTPS site to use GPS; a phone cannot access the teacher's `localhost` address.
 
-## Roster and student PINs
+## Roster
 
-Upload a CSV or Excel `.xlsx` file with `Roll No` and `Name` headers. A `PIN` column is optional. If omitted, the app generates a random personal PIN and offers a one-time CSV download from the teacher dashboard. Give every student only their own PIN through a private channel. Do not publish the PIN file.
+Upload a CSV or Excel `.xlsx` file with `Roll No` and `Name` headers. Extra columns are ignored.
 
 ## Attendance protections
 
 - Each class session accepts check-ins for 5 minutes.
 - The QR link rotates every 15 seconds. Old screenshots stop working after the QR rotates.
-- Students enter their own roll number and personal PIN. A student can mark attendance once per session; the same browser session is blocked from marking another student.
+- Students enter a roll number. After attendance is marked, a persistent browser/device lock blocks any further attendance from that browser for the same session, including if the QR is scanned again.
 - Student GPS must be within 50 metres of the location recorded by the teacher when starting the class.
 - After a session closes or expires, that subject cannot start a new session for 12 hours. Other subjects have their own cooldown.
 - The success page confirms attendance and asks the student to close the tab. Browsers may block a webpage from closing its own tab or opening the phone home screen.
 
-The QR, PIN, and GPS checks deter ordinary sharing. A web page cannot prove that a camera viewed a live screen, prevent deliberate PIN sharing, or reliably detect GPS spoofing. For stronger identity assurance, use student accounts or school sign-in.
+The rotating QR and GPS checks deter ordinary sharing. Since there is no student identity verification, someone using another phone who knows a classmate's roll number may still try to mark attendance as that student. A web page also cannot reliably detect GPS spoofing.
 
 ## Put it on GitHub
 
